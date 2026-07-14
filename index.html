@@ -374,15 +374,31 @@
   <div class="modal-bg" id="modalBg"></div>
   <div class="modal-box">
     <h3>Finalizar pedido</h3>
-    <p class="modal-sub">Confirme seus dados para gerar o Pix.</p>
+    <p class="modal-sub">Dados do cliente, pra gerar o Pix e registrar a venda.</p>
 
     <div class="field">
-      <label>Seu nome</label>
-      <input type="text" id="custName" placeholder="Como podemos te chamar">
+      <label>Nome do cliente</label>
+      <input type="text" id="custName" placeholder="Nome do cliente">
     </div>
     <div class="field">
-      <label>WhatsApp (opcional)</label>
+      <label id="custPhoneLabel">WhatsApp do cliente (opcional)</label>
       <input type="text" id="custPhone" placeholder="(11) 90000-0000">
+    </div>
+    <div class="field">
+      <label>Status da entrega</label>
+      <div style="display:flex; gap:16px; margin-top:6px;">
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text-dim); cursor:pointer;">
+          <input type="radio" name="deliveryStatus" id="statusDelivered" value="delivered" checked>
+          Entregar agora
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text-dim); cursor:pointer;">
+          <input type="radio" name="deliveryStatus" id="statusOrder" value="order">
+          É uma encomenda
+        </label>
+      </div>
+      <p id="orderPhoneHint" style="display:none; color:#E8A33D; font-size:11.5px; margin-top:6px;">
+        Encomendas precisam do WhatsApp do cliente pra combinar a entrega.
+      </p>
     </div>
 
     <div class="receipt" id="receiptBox"></div>
@@ -765,21 +781,34 @@ document.getElementById('confirmSaleBtn').addEventListener('click', async () => 
   const btn = document.getElementById('confirmSaleBtn');
   if (items.length === 0) return;
 
+  const isOrder = document.getElementById('statusOrder').checked;
+  const customerName = document.getElementById('custName').value.trim();
+  const customerPhone = document.getElementById('custPhone').value.trim();
+
+  if (isOrder && !customerPhone) {
+    statusEl.style.color = '#F2545B';
+    statusEl.textContent = 'Encomenda precisa do WhatsApp do cliente antes de confirmar.';
+    document.getElementById('custPhone').focus();
+    return;
+  }
+
   btn.disabled = true;
   btn.textContent = 'Confirmando...';
   statusEl.style.color = 'var(--text-dim)';
   statusEl.textContent = '';
 
   try {
-    // Busca o estoque mais atual antes de confirmar, pra evitar vender
-    // peça que outro vendedor já vendeu nesse meio tempo.
-    const { data, error } = await supabaseClient
-      .from('pita_lab_storage')
-      .select('value')
-      .eq('key', 'pita-lab-stock')
-      .maybeSingle();
+    // Busca o estoque e o histórico de vendas mais atuais antes de confirmar,
+    // pra evitar vender peça que outro vendedor já vendeu nesse meio tempo
+    // e pra gerar o próximo número de pedido corretamente.
+    const [{ data, error }, { data: salesData, error: salesError }] = await Promise.all([
+      supabaseClient.from('pita_lab_storage').select('value').eq('key', 'pita-lab-stock').maybeSingle(),
+      supabaseClient.from('pita_lab_storage').select('value').eq('key', 'pita-lab-sales').maybeSingle(),
+    ]);
     if (error) throw error;
+    if (salesError) throw salesError;
     const stockItems = data && data.value ? JSON.parse(data.value) : [];
+    const currentSales = salesData && salesData.value ? JSON.parse(salesData.value) : [];
 
     // Confere se ainda há estoque suficiente de cada item do carrinho
     for (const { product, qty } of items) {
@@ -796,10 +825,20 @@ document.getElementById('confirmSaleBtn').addEventListener('click', async () => 
       return line ? { ...s, sold: s.sold + line.qty } : s;
     });
 
+    // Gera o próximo número de pedido (sequencial, compartilhado por todos os
+    // itens dessa mesma venda) a partir do maior número já usado no histórico.
+    const maxOrderNumber = currentSales.reduce((max, s) => Math.max(max, s.orderNumber || 0), 0);
+    const orderNumber = maxOrderNumber + 1;
+
     // Monta as entradas de venda, no mesmo formato do histórico de vendas do Precificador
     const now = new Date().toISOString();
+    const saleNote = 'Venda via Portal do Vendedor (Pix)'
+      + (customerName ? ` · Cliente: ${customerName}` : '')
+      + (customerPhone ? ` · ${customerPhone}` : '');
     const newSales = items.map(({ product, qty }) => ({
       id: `sale_${Date.now()}_${product.id}`,
+      orderNumber,
+      delivered: !isOrder,
       stockItemId: product.id,
       itemName: product.name,
       quantity: qty,
@@ -810,17 +849,11 @@ document.getElementById('confirmSaleBtn').addEventListener('click', async () => 
       cost: qty * (product.unitCost || 0),
       profit: qty * (product.price - (product.unitCost || 0)),
       date: now,
-      notes: 'Venda via Portal do Vendedor (Pix)',
+      customerName: customerName || '',
+      customerPhone: customerPhone || '',
+      notes: saleNote,
     }));
 
-    // Busca o histórico de vendas atual pra acrescentar (sem sobrescrever)
-    const { data: salesData, error: salesError } = await supabaseClient
-      .from('pita_lab_storage')
-      .select('value')
-      .eq('key', 'pita-lab-sales')
-      .maybeSingle();
-    if (salesError) throw salesError;
-    const currentSales = salesData && salesData.value ? JSON.parse(salesData.value) : [];
     const updatedSales = [...newSales, ...currentSales];
 
     // Salva os dois de volta no Supabase
@@ -835,7 +868,7 @@ document.getElementById('confirmSaleBtn').addEventListener('click', async () => 
     if (salesSaveError) throw salesSaveError;
 
     statusEl.style.color = '#43C97E';
-    statusEl.textContent = 'Venda confirmada! Estoque atualizado.';
+    statusEl.textContent = `Pedido #${orderNumber} confirmado! Estoque atualizado.`;
     cart = {};
     renderCart();
     setTimeout(() => {
@@ -845,7 +878,7 @@ document.getElementById('confirmSaleBtn').addEventListener('click', async () => 
       statusEl.textContent = '';
       btn.disabled = false;
       btn.textContent = 'Confirmar venda';
-    }, 1500);
+    }, 2000);
   } catch (e) {
     console.error('Falha ao confirmar venda', e);
     statusEl.style.color = '#F2545B';
@@ -853,6 +886,13 @@ document.getElementById('confirmSaleBtn').addEventListener('click', async () => 
     btn.disabled = false;
     btn.textContent = 'Confirmar venda';
   }
+});
+
+document.querySelectorAll('input[name="deliveryStatus"]').forEach(radio => {
+  radio.addEventListener('change', () => {
+    document.getElementById('orderPhoneHint').style.display =
+      document.getElementById('statusOrder').checked ? 'block' : 'none';
+  });
 });
 
 /* init */
